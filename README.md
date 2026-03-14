@@ -1,4 +1,4 @@
-# 🎬 MKV Batch Muxer (批量封装刮削神器)
+# 🎬 MKV-package(批量封装刮削神器)
 
 
 
