@@ -325,26 +325,42 @@ class MuxerViewModel: ObservableObject {
     }
     
     private func extractEpisodeNumber(from filename: String) -> String {
-        let patterns = ["(?i)(?:ep|e)\\s*(\\d+)", "第\\s*(\\d+)\\s*[集话話]", "-\\s*(\\d+)(?!\\d)"]
-        for pattern in patterns {
-            if let regex = try? NSRegularExpression(pattern: pattern),
-               let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)),
-               match.numberOfRanges > 1, let range = Range(match.range(at: 1), in: filename),
-               let num = Int(String(filename[range])) { return String(format: "%02d", num) }
-        }
-        let fallbackPattern = "\\d+"
-        if let regex = try? NSRegularExpression(pattern: fallbackPattern) {
-            let matches = regex.matches(in: filename, range: NSRange(filename.startIndex..., in: filename))
-            let ignoreList = ["1080", "720", "2160", "264", "265", "2020", "2021", "2022", "2023", "2024", "10", "120"]
-            for match in matches {
-                if let range = Range(match.range, in: filename) {
+            // 1. 升级正则：支持识别小数集数 (如 11.5)，(?:\\.\\d+)? 代表可选的小数部分
+            let patterns = [
+                "(?i)(?:ep|e)\\s*(\\d+(?:\\.\\d+)?)",
+                "第\\s*(\\d+(?:\\.\\d+)?)\\s*[集话話]",
+                "-\\s*(\\d+(?:\\.\\d+)?)(?!\\d)"
+            ]
+            
+            for pattern in patterns {
+                if let regex = try? NSRegularExpression(pattern: pattern),
+                   let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)),
+                   match.numberOfRanges > 1, let range = Range(match.range(at: 1), in: filename) {
                     let numStr = String(filename[range])
-                    if !ignoreList.contains(numStr), let num = Int(numStr) { return String(format: "%02d", num) }
+                    if let num = Double(numStr) {
+                        // 如果是纯整数，补齐两位 (如 08)；如果是小数，原样返回 (如 11.5)
+                        return num.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%02d", Int(num)) : numStr
+                    }
                 }
             }
+            
+            let fallbackPattern = "\\d+(?:\\.\\d+)?"
+            if let regex = try? NSRegularExpression(pattern: fallbackPattern) {
+                let matches = regex.matches(in: filename, range: NSRange(filename.startIndex..., in: filename))
+                // 2. 增加防误伤机制：排除 5.1, 7.1, 2.0 等常见声道参数，防止被误认为集数
+                let ignoreList = ["1080", "720", "2160", "264", "265", "2020", "2021", "2022", "2023", "2024", "10", "120", "5.1", "7.1", "2.0", "2.1"]
+                
+                for match in matches {
+                    if let range = Range(match.range, in: filename) {
+                        let numStr = String(filename[range])
+                        if !ignoreList.contains(numStr), let num = Double(numStr) {
+                            return num.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%02d", Int(num)) : numStr
+                        }
+                    }
+                }
+            }
+            return ""
         }
-        return ""
-    }
     
     func translateType(_ type: String) -> String {
         switch type {
