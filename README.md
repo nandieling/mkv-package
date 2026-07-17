@@ -14,6 +14,7 @@
     * 支持为每条轨道指定 ISO 639-2 标准语言代码（内置 80+ 全球语言及搜索功能）。
     * **一键同步**：只需设置第一集，点击“应用到所有”，瞬间完成全季语言配置。
 * **📁 智能匹配与导出**：自动扫描并匹配同目录下的同名视频与外挂字幕，支持自定义输出保存目录。
+* **📋 内置 MediaInfo**：封装完成后可直接生成 MediaInfo 文本，支持一键复制和导出 TXT，无需额外安装 MediaInfo。
 * **📦 纯绿色便携免安装**：已将 `mkvmerge` 及其所有 C++ 动态依赖库（Boost, FLAC 等）完美静态打包至 App 内部。**即开即用，无需用户安装 Homebrew 或 MKVToolNix！**
 
 ## 📸 软件截图
@@ -27,4 +28,20 @@
 3. **⚠️ 首次运行注意事项 (Gatekeeper 解锁)**：
    由于本软件未经过 Apple 开发者账号签名，macOS 可能会提示“文件已损坏”或“无法验证开发者”。请打开 Mac 的 **终端 (Terminal)**，运行以下命令解锁：
    ```bash
-   sudo xattr -cr /Applications/mkv\ package.app
+   sudo xattr -cr "/Applications/MKV Package.app"
+   ```
+
+## 🛠️ 从源码打包
+
+项目使用 SwiftUI 原生 macOS 界面，根目录的 `01.png` 会自动转换为 App 图标。执行：
+
+```bash
+./Scripts/package-mac-app.sh
+```
+
+打包完成后生成：
+
+* `dist/MKV Package.app`
+* `dist/MKV Package.zip`
+
+成品已内置 `mkvmerge`、MediaInfo 及运行所需动态库，不依赖 Homebrew。当前随附的 `mkvmerge` 为 Apple Silicon 版本，最低支持 macOS 14。

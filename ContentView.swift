@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import Foundation
+import CoreFoundation
 import Combine
 
 // MARK: - 全局语言数据库 (包含搜索词典)
@@ -94,6 +95,7 @@ struct MuxJob: Identifiable, Equatable {
     let videoURL: URL
     let subtitleURL: URL
     var status: String = "等待中"
+    var outputURL: URL? = nil
     
     var internalTracks: [MediaTrack] = []
     var externalSubtitleTrack: MediaTrack
@@ -104,6 +106,10 @@ class MuxerViewModel: ObservableObject {
     @Published var jobs: [MuxJob] = []
     @Published var selectedJobID: UUID?
     @Published var isProcessing = false
+    @Published var isGeneratingMediaInfo = false
+    @Published var isShowingMediaInfo = false
+    @Published var mediaInfoText = ""
+    @Published var mediaInfoFileName = ""
     
     // 命名与路径状态
     @Published var outputDirectory: URL? = nil
@@ -123,16 +129,30 @@ class MuxerViewModel: ObservableObject {
         }
         return "/usr/local/bin/mkvmerge"
     }
+
+    var mediaInfoPath: String? {
+        if let bundledPath = Bundle.main.path(forResource: "mediainfo", ofType: nil, inDirectory: "mediainfo_portable") {
+            return bundledPath
+        }
+        if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/mediainfo") {
+            return "/opt/homebrew/bin/mediainfo"
+        }
+        if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/mediainfo") {
+            return "/usr/local/bin/mediainfo"
+        }
+        return nil
+    }
+
+    var selectedOutputURL: URL? {
+        guard let selectedJobID,
+              let job = jobs.first(where: { $0.id == selectedJobID }) else { return nil }
+        return job.outputURL
+    }
     
     // 动态生成预览文件名
     var previewFileName: String {
         if let selectedID = selectedJobID, let job = jobs.first(where: { $0.id == selectedID }) {
-            let episodeNum = extractEpisodeNumber(from: job.baseName)
-            if episodeNum.isEmpty {
-                return "\(customShowName)\(outputPrefix)_\(job.baseName)\(customSuffix).mkv"
-            } else {
-                return "\(customShowName)\(outputPrefix)\(episodeNum)\(customSuffix).mkv"
-            }
+            return outputFileName(for: job)
         } else {
             return "\(customShowName)\(outputPrefix)01\(customSuffix).mkv"
         }
@@ -161,8 +181,33 @@ class MuxerViewModel: ObservableObject {
         panel.prompt = "设为保存目录"
         
         if panel.runModal() == .OK {
-            self.outputDirectory = panel.url
+            if let url = panel.url {
+                self.outputDirectory = url
+                prefillNamingFields(from: url.lastPathComponent)
+            }
         }
+    }
+
+    private func prefillNamingFields(from folderName: String) {
+        // 目录名通常是“主体名.S02.后缀”；以最后一个季号作为拆分点。
+        let pattern = "(?i)S(\\d{1,2})(?:E\\d*(?:\\.\\d+)?)?"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
+
+        let fullRange = NSRange(folderName.startIndex..., in: folderName)
+        let matches = regex.matches(in: folderName, range: fullRange)
+
+        guard let match = matches.last,
+              let seasonRange = Range(match.range(at: 1), in: folderName),
+              let tokenRange = Range(match.range(at: 0), in: folderName),
+              let season = Int(folderName[seasonRange]) else {
+            customShowName = folderName
+            customSuffix = ""
+            return
+        }
+
+        customShowName = String(folderName[..<tokenRange.lowerBound])
+        outputPrefix = String(format: "S%02dE", season)
+        customSuffix = String(folderName[tokenRange.upperBound...])
     }
     
     private func scanAndMatchFiles(in folderURL: URL) {
@@ -273,21 +318,14 @@ class MuxerViewModel: ObservableObject {
                 
                 let job = self.jobs[index]
                 let targetFolderURL = self.outputDirectory ?? job.videoURL.deletingLastPathComponent()
-                
-                let episodeNum = self.extractEpisodeNumber(from: job.baseName)
-                
-                let outputFileName: String
-                if episodeNum.isEmpty {
-                    outputFileName = "\(self.customShowName)\(self.outputPrefix)_\(job.baseName)\(self.customSuffix).mkv"
-                } else {
-                    outputFileName = "\(self.customShowName)\(self.outputPrefix)\(episodeNum)\(self.customSuffix).mkv"
-                }
+                let outputFileName = self.outputFileName(for: job)
                 
                 let outputURL = targetFolderURL.appendingPathComponent(outputFileName)
                 let success = self.runMkvMerge(job: job, output: outputURL)
                 
                 DispatchQueue.main.async {
                     self.jobs[index].status = success ? "✅ \(outputFileName)" : "❌ 失败"
+                    self.jobs[index].outputURL = success ? outputURL : nil
                 }
             }
             DispatchQueue.main.async { self.isProcessing = false }
@@ -304,11 +342,21 @@ class MuxerViewModel: ObservableObject {
         for track in job.internalTracks {
             args.append("--language")
             args.append("\(track.trackID):\(track.language)")
+            if track.type == "subtitles" {
+                args.append("--default-track")
+                args.append("\(track.trackID):no")
+            }
         }
         args.append(job.videoURL.path)
         
         args.append("--language")
         args.append("0:\(job.externalSubtitleTrack.language)")
+        args.append("--default-track")
+        args.append("0:yes")
+        if let characterSet = detectSubtitleCharacterSet(at: job.subtitleURL) {
+            args.append("--sub-charset")
+            args.append("0:\(characterSet)")
+        }
         args.append(job.subtitleURL.path)
         
         process.arguments = args
@@ -318,49 +366,147 @@ class MuxerViewModel: ObservableObject {
         do {
             try process.run()
             process.waitUntilExit()
-            return process.terminationStatus == 0
+            // mkvmerge: 0 = 成功，1 = 成功但有警告，2 = 失败。
+            return process.terminationStatus < 2
         } catch {
             return false
         }
     }
-    
-    private func extractEpisodeNumber(from filename: String) -> String {
-            // 1. 升级正则：支持识别小数集数 (如 11.5)，(?:\\.\\d+)? 代表可选的小数部分
-            let patterns = [
-                "(?i)(?:ep|e)\\s*(\\d+(?:\\.\\d+)?)",
-                "第\\s*(\\d+(?:\\.\\d+)?)\\s*[集话話]",
-                "-\\s*(\\d+(?:\\.\\d+)?)(?!\\d)"
-            ]
-            
-            for pattern in patterns {
-                if let regex = try? NSRegularExpression(pattern: pattern),
-                   let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)),
-                   match.numberOfRanges > 1, let range = Range(match.range(at: 1), in: filename) {
-                    let numStr = String(filename[range])
-                    if let num = Double(numStr) {
-                        // 如果是纯整数，补齐两位 (如 08)；如果是小数，原样返回 (如 11.5)
-                        return num.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%02d", Int(num)) : numStr
-                    }
-                }
-            }
-            
-            let fallbackPattern = "\\d+(?:\\.\\d+)?"
-            if let regex = try? NSRegularExpression(pattern: fallbackPattern) {
-                let matches = regex.matches(in: filename, range: NSRange(filename.startIndex..., in: filename))
-                // 2. 增加防误伤机制：排除 5.1, 7.1, 2.0 等常见声道参数，防止被误认为集数
-                let ignoreList = ["1080", "720", "2160", "264", "265", "2020", "2021", "2022", "2023", "2024", "10", "120", "5.1", "7.1", "2.0", "2.1"]
-                
-                for match in matches {
-                    if let range = Range(match.range, in: filename) {
-                        let numStr = String(filename[range])
-                        if !ignoreList.contains(numStr), let num = Double(numStr) {
-                            return num.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%02d", Int(num)) : numStr
-                        }
-                    }
-                }
-            }
-            return ""
+
+    private func detectSubtitleCharacterSet(at fileURL: URL) -> String? {
+        guard let data = try? Data(contentsOf: fileURL), !data.isEmpty else { return nil }
+
+        // UTF-8 是 mkvmerge 的默认值，无需额外参数。
+        if String(data: data, encoding: .utf8) != nil { return nil }
+
+        var convertedString: NSString?
+        var usedLossyConversion = ObjCBool(false)
+        let encoding = NSString.stringEncoding(
+            for: data,
+            encodingOptions: nil,
+            convertedString: &convertedString,
+            usedLossyConversion: &usedLossyConversion
+        )
+
+        guard convertedString != nil, !usedLossyConversion.boolValue else { return nil }
+        let cfEncoding = CFStringConvertNSStringEncodingToEncoding(encoding)
+        guard cfEncoding != kCFStringEncodingInvalidId,
+              let characterSetName = CFStringConvertEncodingToIANACharSetName(cfEncoding) else {
+            return nil
         }
+
+        return characterSetName as String
+    }
+
+    func generateMediaInfoForSelectedJob() {
+        guard let outputURL = selectedOutputURL else { return }
+        guard let mediaInfoPath else {
+            mediaInfoFileName = outputURL.lastPathComponent
+            mediaInfoText = "未找到 mediainfo 命令行工具。请重新使用打包脚本生成 App，或安装 MediaInfo。"
+            isShowingMediaInfo = true
+            return
+        }
+
+        isGeneratingMediaInfo = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            let standardOutput = Pipe()
+            let standardError = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: mediaInfoPath)
+            process.arguments = [outputURL.path]
+            process.standardOutput = standardOutput
+            process.standardError = standardError
+
+            let resultText: String
+            do {
+                try process.run()
+                let outputData = standardOutput.fileHandleForReading.readDataToEndOfFile()
+                let errorData = standardError.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+
+                if process.terminationStatus == 0 {
+                    resultText = String(data: outputData, encoding: .utf8) ?? "MediaInfo 输出无法解码。"
+                } else {
+                    let errorText = String(data: errorData, encoding: .utf8) ?? "未知错误"
+                    resultText = "MediaInfo 生成失败：\n\(errorText)"
+                }
+            } catch {
+                resultText = "MediaInfo 生成失败：\n\(error.localizedDescription)"
+            }
+
+            DispatchQueue.main.async {
+                self.mediaInfoFileName = outputURL.lastPathComponent
+                self.mediaInfoText = resultText
+                self.isGeneratingMediaInfo = false
+                self.isShowingMediaInfo = true
+            }
+        }
+    }
+    
+    private func outputFileName(for job: MuxJob) -> String {
+        let episodeNum = extractEpisodeNumber(from: job.baseName)
+        if episodeNum.isEmpty {
+            return "\(customShowName)\(outputPrefix)_\(job.baseName)\(customSuffix).mkv"
+        }
+
+        return "\(customShowName)\(outputPrefix)\(episodeNum)\(customSuffix).mkv"
+    }
+
+    private func extractEpisodeNumber(from filename: String) -> String {
+        let patterns = [
+            "^\\s*(\\d+(?:\\.\\d+)?)\\s*$",
+            "(?i)(?:ep|e)\\s*(\\d+(?:\\.\\d+)?)",
+            "第\\s*(\\d+(?:\\.\\d+)?)\\s*[集话話]",
+            "-\\s*(\\d+(?:\\.\\d+)?)(?!\\d)"
+        ]
+
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern),
+               let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)),
+               match.numberOfRanges > 1,
+               let range = Range(match.range(at: 1), in: filename),
+               let formatted = formatEpisodeNumber(String(filename[range])) {
+                return formatted
+            }
+        }
+
+        let fallbackPattern = "\\d+(?:\\.\\d+)?"
+        if let regex = try? NSRegularExpression(pattern: fallbackPattern) {
+            let matches = regex.matches(in: filename, range: NSRange(filename.startIndex..., in: filename))
+            let ignoreList = ["1080", "720", "2160", "264", "265", "2020", "2021", "2022", "2023", "2024", "120", "5.1", "7.1", "2.0", "2.1"]
+
+            for match in matches {
+                if let range = Range(match.range, in: filename) {
+                    let numStr = String(filename[range])
+                    if !ignoreList.contains(numStr),
+                       !isTechnicalNumber(numStr, endingAt: range.upperBound, in: filename),
+                       let formatted = formatEpisodeNumber(numStr) {
+                        return formatted
+                    }
+                }
+            }
+        }
+        return ""
+    }
+
+    private func formatEpisodeNumber(_ value: String) -> String? {
+        guard let number = Double(value) else { return nil }
+        return number.truncatingRemainder(dividingBy: 1) == 0
+            ? String(format: "%02d", Int(number))
+            : value
+    }
+
+    private func isTechnicalNumber(_ value: String, endingAt endIndex: String.Index, in filename: String) -> Bool {
+        let trailingText = filename[endIndex...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if value == "10" && trailingText.hasPrefix("bit") { return true }
+        if value == "120" && trailingText.hasPrefix("fps") { return true }
+        return false
+    }
     
     func translateType(_ type: String) -> String {
         switch type {
@@ -484,6 +630,75 @@ struct TrackRowView: View {
         .padding(.vertical, 4)
         .sheet(isPresented: $showSearchSheet) {
             LanguageSearchSheet(selectedCode: $track.language)
+        }
+    }
+}
+
+// MARK: - MediaInfo 查看、复制与导出窗口
+struct MediaInfoSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var text: String
+    let fileName: String
+    @State private var exportMessage = ""
+
+    private var suggestedExportName: String {
+        let stem = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
+        return "\(stem).MediaInfo.txt"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("MediaInfo")
+                .font(.title2.bold())
+            Text(fileName)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            TextEditor(text: $text)
+                .font(.system(.body, design: .monospaced))
+                .frame(minWidth: 760, minHeight: 500)
+                .border(Color.secondary.opacity(0.3))
+
+            HStack {
+                Button("复制全部") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                    exportMessage = "已复制到剪贴板"
+                }
+
+                Button("导出 TXT…") {
+                    exportText()
+                }
+
+                if !exportMessage.isEmpty {
+                    Text(exportMessage)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+                Button("关闭") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+    }
+
+    private func exportText() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = suggestedExportName
+        panel.canCreateDirectories = true
+        panel.message = "导出 MediaInfo 文本信息"
+
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+        do {
+            try text.write(to: destination, atomically: true, encoding: .utf8)
+            exportMessage = "已导出：\(destination.lastPathComponent)"
+        } catch {
+            exportMessage = "导出失败：\(error.localizedDescription)"
         }
     }
 }
@@ -637,19 +852,39 @@ struct ContentView: View {
             
             Divider()
             
-            // MARK: - 底部运行按钮
-            Button(action: {
-                viewModel.startBatchMuxing()
-            }) {
-                Text(viewModel.isProcessing ? "正在封装..." : "开始批量封装 (\(viewModel.jobs.count) 个文件)")
-                    .frame(maxWidth: .infinity)
+            // MARK: - 底部操作按钮
+            HStack(spacing: 12) {
+                Button(action: {
+                    viewModel.startBatchMuxing()
+                }) {
+                    Text(viewModel.isProcessing ? "正在封装..." : "开始批量封装 (\(viewModel.jobs.count) 个文件)")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(viewModel.jobs.isEmpty || viewModel.isProcessing)
+
+                Button(action: {
+                    viewModel.generateMediaInfoForSelectedJob()
+                }) {
+                    HStack {
+                        Image(systemName: "doc.text.magnifyingglass")
+                        Text(viewModel.isGeneratingMediaInfo ? "正在生成…" : "生成 MediaInfo")
+                    }
+                    .frame(minWidth: 150)
+                }
+                .controlSize(.large)
+                .disabled(viewModel.selectedOutputURL == nil || viewModel.isProcessing || viewModel.isGeneratingMediaInfo)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(viewModel.jobs.isEmpty || viewModel.isProcessing)
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
         }
         .frame(minWidth: 900, minHeight: 600)
+        .sheet(isPresented: $viewModel.isShowingMediaInfo) {
+            MediaInfoSheet(
+                text: $viewModel.mediaInfoText,
+                fileName: viewModel.mediaInfoFileName
+            )
+        }
     }
 }
