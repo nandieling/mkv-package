@@ -17,6 +17,15 @@ APP_EXECUTABLE="$MACOS_DIR/mkv-package"
 ICON_SOURCE="$ROOT_DIR/01.png"
 MKVMERGE_SOURCE="$ROOT_DIR/mkvmerge_portable/mkvmerge"
 MEDIAINFO_SOURCE="$ROOT_DIR/mediainfo_portable/mediainfo"
+FFMPEG_SOURCE="${FFMPEG_SOURCE:-$ROOT_DIR/ffmpeg_portable/ffmpeg}"
+FFPROBE_SOURCE="${FFPROBE_SOURCE:-$ROOT_DIR/ffmpeg_portable/ffprobe}"
+
+if [[ ! -f "$FFMPEG_SOURCE" ]]; then
+    FFMPEG_SOURCE="$(command -v ffmpeg || true)"
+fi
+if [[ ! -f "$FFPROBE_SOURCE" ]]; then
+    FFPROBE_SOURCE="$(command -v ffprobe || true)"
+fi
 
 require_file() {
     if [[ ! -f "$1" ]]; then
@@ -36,6 +45,8 @@ require_file "$ROOT_DIR/ContentView.swift"
 require_file "$ICON_SOURCE"
 require_file "$MKVMERGE_SOURCE"
 require_file "$MEDIAINFO_SOURCE"
+require_file "$FFMPEG_SOURCE"
+require_file "$FFPROBE_SOURCE"
 require_command xcrun
 require_command sips
 require_command otool
@@ -158,7 +169,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "[4/7] 内置 mkvmerge 与 MediaInfo"
+echo "[4/7] 内置 mkvmerge、MediaInfo 与 FFmpeg"
 ditto "$ROOT_DIR/mkvmerge_portable" "$RESOURCES_DIR/mkvmerge_portable"
 ditto "$ROOT_DIR/mediainfo_portable" "$RESOURCES_DIR/mediainfo_portable"
 chmod +x "$RESOURCES_DIR/mkvmerge_portable/mkvmerge"
@@ -218,7 +229,7 @@ while [[ $index -lt ${#SOURCE_BINARIES[@]} ]]; do
                 ;;
             @rpath/*)
                 dependency_name="$(basename "$dependency")"
-                resolved_dependency="$(find /opt/homebrew /usr/local -type f -name "$dependency_name" -print -quit 2>/dev/null || true)"
+                resolved_dependency="$(find -L /opt/homebrew /usr/local -type f -name "$dependency_name" -print -quit 2>/dev/null || true)"
                 ;;
             /*)
                 resolved_dependency="$dependency"
@@ -260,8 +271,101 @@ for staged_binary in "${STAGED_BINARIES[@]}"; do
     fi
 done
 
-echo "[5/7] 检查便携依赖"
+ALL_STAGED_BINARIES=("${STAGED_BINARIES[@]}")
+
+# FFmpeg 与 ffprobe 共用一套便携动态库。
+FFMPEG_TOOL_DIR="$RESOURCES_DIR/ffmpeg_portable"
+FFMPEG_LIB_DIR="$FFMPEG_TOOL_DIR/libs"
+mkdir -p "$FFMPEG_LIB_DIR"
+cp -L "$FFMPEG_SOURCE" "$FFMPEG_TOOL_DIR/ffmpeg"
+cp -L "$FFPROBE_SOURCE" "$FFMPEG_TOOL_DIR/ffprobe"
+chmod +x "$FFMPEG_TOOL_DIR/ffmpeg" "$FFMPEG_TOOL_DIR/ffprobe"
+
+SOURCE_BINARIES=("$(realpath "$FFMPEG_SOURCE")" "$(realpath "$FFPROBE_SOURCE")")
+STAGED_BINARIES=("$FFMPEG_TOOL_DIR/ffmpeg" "$FFMPEG_TOOL_DIR/ffprobe")
+MKV_LIB_DIR="$FFMPEG_LIB_DIR"
+
+# Homebrew 的 SDL2 当前是 sdl2-compat，会通过 dlopen 动态寻找 SDL3，otool 无法发现此依赖。
+SDL3_SOURCE="${SDL3_SOURCE:-$ROOT_DIR/ffmpeg_portable/libs/libSDL3.dylib}"
+if [[ ! -f "$SDL3_SOURCE" ]]; then
+    SDL3_SOURCE="/opt/homebrew/opt/sdl3/lib/libSDL3.dylib"
+fi
+if [[ -f "$SDL3_SOURCE" ]]; then
+    queue_dependency "$SDL3_SOURCE"
+fi
+
+index=0
+while [[ $index -lt ${#SOURCE_BINARIES[@]} ]]; do
+    source_binary="${SOURCE_BINARIES[$index]}"
+    while IFS= read -r dependency; do
+        [[ -z "$dependency" ]] && continue
+        case "$dependency" in
+            /System/*|/usr/lib/*)
+                continue
+                ;;
+            @executable_path/libs/*)
+                dependency_name="$(basename "$dependency")"
+                resolved_dependency="$(find -L "$(dirname "$source_binary")" /opt/homebrew /usr/local -type f -name "$dependency_name" -print -quit 2>/dev/null || true)"
+                ;;
+            @loader_path/*)
+                resolved_dependency="$(dirname "$source_binary")/${dependency#@loader_path/}"
+                ;;
+            @rpath/*)
+                dependency_name="$(basename "$dependency")"
+                resolved_dependency="$(find -L /opt/homebrew /usr/local -type f -name "$dependency_name" -print -quit 2>/dev/null || true)"
+                ;;
+            /*)
+                resolved_dependency="$dependency"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        if [[ -n "${resolved_dependency:-}" && -f "$resolved_dependency" ]]; then
+            queue_dependency "$resolved_dependency"
+        else
+            echo "无法找到 FFmpeg 依赖：$dependency" >&2
+            exit 1
+        fi
+    done < <(otool -L "$source_binary" | awk 'NR > 1 { print $1 }')
+    index=$((index + 1))
+done
+
 for staged_binary in "${STAGED_BINARIES[@]}"; do
+    while IFS= read -r dependency; do
+        case "$dependency" in
+            /System/*|/usr/lib/*|@executable_path/libs/*)
+                continue
+                ;;
+            /opt/homebrew/*|/usr/local/*|@rpath/*|@loader_path/*)
+                install_name_tool -change "$dependency" "@executable_path/libs/$(basename "$dependency")" "$staged_binary"
+                ;;
+        esac
+    done < <(otool -L "$staged_binary" | awk 'NR > 1 { print $1 }')
+
+    if [[ "$staged_binary" != "$FFMPEG_TOOL_DIR/ffmpeg" && "$staged_binary" != "$FFMPEG_TOOL_DIR/ffprobe" ]]; then
+        current_id="$(otool -D "$staged_binary" 2>/dev/null | tail -n 1 || true)"
+        case "$current_id" in
+            /opt/homebrew/*|/usr/local/*|@rpath/*|@loader_path/*)
+                install_name_tool -id "@executable_path/libs/$(basename "$staged_binary")" "$staged_binary"
+                ;;
+        esac
+    fi
+done
+
+FONTCONFIG_SOURCE="${FONTCONFIG_SOURCE:-/opt/homebrew/etc/fonts}"
+if [[ -d "$ROOT_DIR/ffmpeg_portable/fontconfig" ]]; then
+    FONTCONFIG_SOURCE="$ROOT_DIR/ffmpeg_portable/fontconfig"
+fi
+if [[ -d "$FONTCONFIG_SOURCE" ]]; then
+    ditto "$FONTCONFIG_SOURCE" "$FFMPEG_TOOL_DIR/fontconfig"
+fi
+
+ALL_STAGED_BINARIES+=("${STAGED_BINARIES[@]}")
+
+echo "[5/7] 检查便携依赖"
+for staged_binary in "${ALL_STAGED_BINARIES[@]}"; do
     if otool -L "$staged_binary" | awk 'NR > 1 { print $1 }' | grep -E '^(/opt/homebrew|/usr/local)' >/dev/null; then
         echo "仍存在外部依赖：$staged_binary" >&2
         otool -L "$staged_binary" >&2
@@ -270,7 +374,7 @@ for staged_binary in "${STAGED_BINARIES[@]}"; do
 done
 
 echo "[6/7] 对 App 内所有可执行文件进行临时签名"
-for staged_binary in "${STAGED_BINARIES[@]}"; do
+for staged_binary in "${ALL_STAGED_BINARIES[@]}"; do
     codesign --force --sign - --timestamp=none "$staged_binary"
 done
 codesign --force --sign - --timestamp=none "$RESOURCES_DIR/mediainfo_portable/mediainfo"

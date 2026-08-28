@@ -1,39 +1,71 @@
-# 🎬 MKV-package(批量封装刮削神器)
+# MKV Package（批量封装刮削工具）
 
+面向 PT 用户和 Emby、Plex、Jellyfin 媒体库用户的 macOS 原生批量 MKV 封装工具。它可以自动匹配视频与外挂字幕、整理轨道语言，并按 `S01E01` 格式批量命名；整个过程无需手动编写 `mkvmerge` 命令。
 
+## 核心功能
 
-专为 PT 玩家和 Emby / Plex / Jellyfin 影音发烧友打造的 **macOS 本地原生批量 MKV 封装工具**。
-无需繁琐的命令行，一键将乱七八糟的视频与字幕自动匹配，并重命名为完美的 `S01E01` 刮削格式！
+- **智能匹配**：扫描同一目录下同名的视频和字幕，支持 `mkv`、`m2ts`、`mp4` 视频以及 `srt`、`ass` 字幕。
+- **集数提取与刮削命名**：可从 `EP08`、`E08`、`第 8 集`、`- 08` 等文件名中提取集数，支持小数集，并自动避开常见的分辨率、编码和帧率数字。
+- **自定义命名**：支持“主体名 + 季集前缀 + 后缀”，实时预览输出文件名；选择保存目录时可根据目录名自动填充季数等字段。
+- **轨道语言编辑**：使用 `mkvmerge` 读取视频、音频和字幕轨道，可搜索并设置 ISO 639 语言代码。修改任意一集的语言后，会按轨道 ID 自动同步到整批任务，外挂字幕语言也会同步。
+- **自动 MediaInfo**：批量封装过程中自动生成 `影片名.MediaInfo.txt`。可设置整批获取个数和独立保存目录，默认生成 1 份并保存到输入目录。
+- **自动字幕截图**：使用 FFmpeg/ffprobe 在字幕出现的时间点生成原始分辨率 PNG，可设置整批截图总数和独立保存目录，默认生成 3 张并分配到批量任务中。优先选择最后一条中文轨，没有中文轨时使用最后一条字幕轨，同时支持文本字幕和图形字幕。
+- **自定义界面背景**：可选择本地图片作为背景，支持实时调整透明度或一键清除。
+- **便携运行**：发布版 App 内置 `mkvmerge`、MediaInfo、FFmpeg、ffprobe 及所需动态库，无需另外安装 Homebrew、MKVToolNix、MediaInfo 或 FFmpeg。
 
-## ✨ 核心功能
+## 本次更新
 
-* **🤖 智能集数提取**：采用正则算法，自动从杂乱的原文件名（如 `[字幕组] 权游 EP08 1080p x265.mp4`）中精准提取集数 `08`。
-* **🏷️ 完美刮削命名**：支持自定义“前缀 + 季数 + 后缀”，实时预览最终文件名（如 `权力的游戏 S01E08 1080p.mkv`），让媒体库瞬间整齐划一。
-* **🌍 精细化轨道语言编辑**：
-    * 底层调用 `mkvmerge` 极速读取内部轨道（视频、音频、字幕）。
-    * 支持为每条轨道指定 ISO 639-2 标准语言代码（内置 80+ 全球语言及搜索功能）。
-    * **一键同步**：只需设置第一集，点击“应用到所有”，瞬间完成全季语言配置。
-* **📁 智能匹配与导出**：自动扫描并匹配同目录下的同名视频与外挂字幕，支持自定义输出保存目录。
-* **📋 内置 MediaInfo**：封装完成后可直接生成 MediaInfo 文本，支持一键复制和导出 TXT，无需额外安装 MediaInfo。
-* **📦 纯绿色便携免安装**：已将 `mkvmerge` 及其所有 C++ 动态依赖库（Boost, FLAC 等）完美静态打包至 App 内部。**即开即用，无需用户安装 Homebrew 或 MKVToolNix！**
+### 新增
 
-## 📸 软件截图
+- MediaInfo 改为随批量封装自动生成，并支持设置整批生成数量与单独的保存目录。
+- 新增自动字幕截图，按字幕时间点取帧并烧录所选字幕；截图文件按 `影片名.01.png`、`影片名.02.png` 格式保存。
+- 新增 FFmpeg、ffprobe 和字体配置的便携打包支持。
+- 新增自定义背景图片和透明度控制。
+- 轨道语言改为编辑后自动同步到其他任务，无需再点击“应用到所有”。
 
-![](https://img2.pixhost.to/images/6426/704449489_2026-03-14-20-33-22.png)
+### 修复与优化
 
-## 🚀 安装与运行 (普通用户)
+- 封装失败与后处理失败现在分别显示：MKV 已成功生成但 MediaInfo 或截图失败时，会保留输出并显示警告状态。
+- 优化截图轨道选择和时间点计算；无法读取字幕时间点时，会根据影片时长均匀取帧。
+- 截图中优先使用中文字体配置，并兼容文本字幕与图形字幕。
+- 调整文件列表与轨道面板的自适应宽度，改善窗口缩放和背景图片下的可读性。
+- 修复打包脚本对 Homebrew 符号链接及递归动态库依赖的处理，并在产物生成前检查外部依赖、统一签名 App 内二进制。
 
-1. 在 **Release** 页面下载最新版的 `mkv package.app`。
-2. 将其拖入你的 `应用程序 (Applications)` 文件夹。
-3. **⚠️ 首次运行注意事项 (Gatekeeper 解锁)**：
-   由于本软件未经过 Apple 开发者账号签名，macOS 可能会提示“文件已损坏”或“无法验证开发者”。请打开 Mac 的 **终端 (Terminal)**，运行以下命令解锁：
-   ```bash
-   sudo xattr -cr "/Applications/MKV Package.app"
-   ```
+## 软件截图
 
-## 🛠️ 从源码打包
+![](https://img3.pixhost.cc/images/5277/763235141_2026-08-28-08-53-05.png)
 
-项目使用 SwiftUI 原生 macOS 界面，根目录的 `01.png` 会自动转换为 App 图标。执行：
+## 使用方法
+
+1. 将视频与对应外挂字幕放在同一目录，并确保扩展名之前的文件名完全相同，例如 `01.mkv` 与 `01.ass`。
+2. 点击“选择输入文件夹”。程序会扫描匹配文件、读取内部轨道，并默认把 MediaInfo 和截图目录设为输入目录。
+3. 按需选择 MKV 保存目录、MediaInfo 目录和截图目录，设置命名字段及整批生成数量。
+4. 在轨道列表中调整语言。每次修改会自动同步到其他匹配任务。
+5. 点击“开始批量封装”。任务状态会分别反映封装、MediaInfo 和截图进度。
+
+> “MediaInfo 获取个数”和“截图张数”均指本次批量任务的总数，不是每个视频各自生成的数量。
+
+## 安装与运行
+
+1. 从 [Releases](https://github.com/nandieling/mkv-package/releases) 下载最新版 `MKV Package.app`，并拖入“应用程序”文件夹。
+2. 由于 App 未使用 Apple 开发者证书签名，首次运行若提示“文件已损坏”或“无法验证开发者”，请在终端执行：
+
+```bash
+sudo xattr -cr "/Applications/MKV Package.app"
+```
+
+当前发布版面向 Apple Silicon，最低支持 macOS 14。
+
+## 从源码打包
+
+打包需要 macOS 14 或更高版本及 Xcode Command Line Tools。仓库根目录还需包含：
+
+- `01.png`
+- `mkvmerge_portable/mkvmerge`
+- `mediainfo_portable/mediainfo`
+- `ffmpeg_portable/ffmpeg` 与 `ffmpeg_portable/ffprobe`，或构建机 `PATH` 中可用的 `ffmpeg` 与 `ffprobe`
+
+执行：
 
 ```bash
 ./Scripts/package-mac-app.sh
@@ -41,7 +73,9 @@
 
 打包完成后生成：
 
-* `dist/MKV Package.app`
-* `dist/MKV Package.zip`
+- `dist/MKV Package.app`
+- `dist/MKV Package.zip`
 
-成品已内置 `mkvmerge`、MediaInfo 及运行所需动态库，不依赖 Homebrew。当前随附的 `mkvmerge` 为 Apple Silicon 版本，最低支持 macOS 14。
+脚本会递归收集非系统动态库、改写加载路径、检查是否仍引用 `/opt/homebrew` 或 `/usr/local`，然后对 App 内二进制进行临时签名。生成的 App 会内置 `mkvmerge`、MediaInfo、FFmpeg、ffprobe、可用的 Fontconfig 配置及相关动态库。
+
+如需指定本地工具或资源，可在执行脚本前设置 `FFMPEG_SOURCE`、`FFPROBE_SOURCE`、`FONTCONFIG_SOURCE` 或 `SDL3_SOURCE`。产物架构跟随仓库内的 `mkvmerge`；当前随附版本为 Apple Silicon。

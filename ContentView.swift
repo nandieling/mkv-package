@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 import Foundation
 import CoreFoundation
 import Combine
+import AppKit
 
 // MARK: - 全局语言数据库 (包含搜索词典)
 struct LanguageInfo: Identifiable {
@@ -96,6 +97,8 @@ struct MuxJob: Identifiable, Equatable {
     let subtitleURL: URL
     var status: String = "等待中"
     var outputURL: URL? = nil
+    var mediaInfoURL: URL? = nil
+    var screenshotURLs: [URL] = []
     
     var internalTracks: [MediaTrack] = []
     var externalSubtitleTrack: MediaTrack
@@ -103,16 +106,33 @@ struct MuxJob: Identifiable, Equatable {
 
 // MARK: - 逻辑处理 ViewModel
 class MuxerViewModel: ObservableObject {
+    private enum PostProcessingError: LocalizedError {
+        case toolUnavailable(String)
+        case commandFailed(String)
+        case invalidOutput(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .toolUnavailable(let tool):
+                return "未找到 \(tool) 命令行工具"
+            case .commandFailed(let message), .invalidOutput(let message):
+                return message
+            }
+        }
+    }
+
     @Published var jobs: [MuxJob] = []
     @Published var selectedJobID: UUID?
     @Published var isProcessing = false
-    @Published var isGeneratingMediaInfo = false
-    @Published var isShowingMediaInfo = false
-    @Published var mediaInfoText = ""
-    @Published var mediaInfoFileName = ""
     
     // 命名与路径状态
     @Published var outputDirectory: URL? = nil
+    @Published var mediaInfoDirectory: URL? = nil
+    @Published var screenshotDirectory: URL? = nil
+    @Published var mediaInfoCount: Int = 1
+    @Published var screenshotCount: Int = 3
+    @Published var backgroundImageURL: URL? = nil
+    @Published var backgroundOpacity: Double = 0.15
     @Published var customShowName: String = ""
     @Published var outputPrefix: String = "S01E"
     @Published var customSuffix: String = ""
@@ -143,11 +163,38 @@ class MuxerViewModel: ObservableObject {
         return nil
     }
 
+    var ffmpegPath: String? {
+        if let bundledPath = Bundle.main.path(forResource: "ffmpeg", ofType: nil, inDirectory: "ffmpeg_portable") {
+            return bundledPath
+        }
+        if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/ffmpeg") {
+            return "/opt/homebrew/bin/ffmpeg"
+        }
+        if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/ffmpeg") {
+            return "/usr/local/bin/ffmpeg"
+        }
+        return nil
+    }
+
+    var ffprobePath: String? {
+        if let bundledPath = Bundle.main.path(forResource: "ffprobe", ofType: nil, inDirectory: "ffmpeg_portable") {
+            return bundledPath
+        }
+        if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/ffprobe") {
+            return "/opt/homebrew/bin/ffprobe"
+        }
+        if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/ffprobe") {
+            return "/usr/local/bin/ffprobe"
+        }
+        return nil
+    }
+
     var selectedOutputURL: URL? {
         guard let selectedJobID,
               let job = jobs.first(where: { $0.id == selectedJobID }) else { return nil }
         return job.outputURL
     }
+
     
     // 动态生成预览文件名
     var previewFileName: String {
@@ -188,6 +235,46 @@ class MuxerViewModel: ObservableObject {
         }
     }
 
+    func selectMediaInfoDirectory() {
+        selectArtifactDirectory(
+            message: "选择 MediaInfo 文本的保存目录",
+            prompt: "设为 MediaInfo 目录"
+        ) { self.mediaInfoDirectory = $0 }
+    }
+
+    func selectScreenshotDirectory() {
+        selectArtifactDirectory(
+            message: "选择字幕截图的保存目录",
+            prompt: "设为截图目录"
+        ) { self.screenshotDirectory = $0 }
+    }
+
+    func selectBackgroundImage() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.image]
+        panel.message = "选择界面背景图片"
+        panel.prompt = "使用此图片"
+        if panel.runModal() == .OK {
+            backgroundImageURL = panel.url
+        }
+    }
+
+    private func selectArtifactDirectory(message: String, prompt: String, completion: (URL) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = message
+        panel.prompt = prompt
+
+        if panel.runModal() == .OK, let url = panel.url {
+            completion(url)
+        }
+    }
+
     private func prefillNamingFields(from folderName: String) {
         // 目录名通常是“主体名.S02.后缀”；以最后一个季号作为拆分点。
         let pattern = "(?i)S(\\d{1,2})(?:E\\d*(?:\\.\\d+)?)?"
@@ -213,6 +300,9 @@ class MuxerViewModel: ObservableObject {
     private func scanAndMatchFiles(in folderURL: URL) {
         jobs.removeAll()
         selectedJobID = nil
+        // MediaInfo 与截图默认写回输入文件夹。
+        mediaInfoDirectory = folderURL
+        screenshotDirectory = folderURL
         let fileManager = FileManager.default
         guard let files = try? fileManager.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil) else { return }
         
@@ -292,19 +382,26 @@ class MuxerViewModel: ObservableObject {
         }
     }
     
-    func applyCurrentSettingsToAll() {
-        guard let selectedJobIndex = jobs.firstIndex(where: { $0.id == selectedJobID }) else { return }
-        let sourceJob = jobs[selectedJobIndex]
-        
-        for i in 0..<jobs.count {
-            if i == selectedJobIndex { continue }
-            for j in 0..<jobs[i].internalTracks.count {
-                let trackID = jobs[i].internalTracks[j].trackID
+    func setLanguage(_ language: String, for track: MediaTrack, in sourceJobID: UUID) {
+        guard let sourceJobIndex = jobs.firstIndex(where: { $0.id == sourceJobID }) else { return }
+
+        if track.isExternal {
+            jobs[sourceJobIndex].externalSubtitleTrack.language = language
+        } else if let trackIndex = jobs[sourceJobIndex].internalTracks.firstIndex(
+            where: { $0.trackID == track.trackID }
+        ) {
+            jobs[sourceJobIndex].internalTracks[trackIndex].language = language
+        }
+
+        let sourceJob = jobs[sourceJobIndex]
+        for jobIndex in jobs.indices where jobIndex != sourceJobIndex {
+            for trackIndex in jobs[jobIndex].internalTracks.indices {
+                let trackID = jobs[jobIndex].internalTracks[trackIndex].trackID
                 if let sourceTrack = sourceJob.internalTracks.first(where: { $0.trackID == trackID }) {
-                    jobs[i].internalTracks[j].language = sourceTrack.language
+                    jobs[jobIndex].internalTracks[trackIndex].language = sourceTrack.language
                 }
             }
-            jobs[i].externalSubtitleTrack.language = sourceJob.externalSubtitleTrack.language
+            jobs[jobIndex].externalSubtitleTrack.language = sourceJob.externalSubtitleTrack.language
         }
     }
     
@@ -313,6 +410,12 @@ class MuxerViewModel: ObservableObject {
         isProcessing = true
         
         DispatchQueue.global(qos: .userInitiated).async {
+            let requestedMediaInfoCount = max(0, self.mediaInfoCount)
+            let requestedScreenshotCount = max(0, self.screenshotCount)
+            let totalJobCount = self.jobs.count
+            var generatedMediaInfoCount = 0
+            var generatedScreenshotCount = 0
+
             for index in self.jobs.indices {
                 DispatchQueue.main.async { self.jobs[index].status = "处理中..." }
                 
@@ -322,10 +425,76 @@ class MuxerViewModel: ObservableObject {
                 
                 let outputURL = targetFolderURL.appendingPathComponent(outputFileName)
                 let success = self.runMkvMerge(job: job, output: outputURL)
-                
+
+                guard success else {
+                    DispatchQueue.main.async {
+                        self.jobs[index].status = "❌ 封装失败"
+                        self.jobs[index].outputURL = nil
+                    }
+                    continue
+                }
+
                 DispatchQueue.main.async {
-                    self.jobs[index].status = success ? "✅ \(outputFileName)" : "❌ 失败"
-                    self.jobs[index].outputURL = success ? outputURL : nil
+                    self.jobs[index].outputURL = outputURL
+                }
+
+                var failures: [String] = []
+                if generatedMediaInfoCount < requestedMediaInfoCount {
+                    let nextMediaInfoNumber = generatedMediaInfoCount + 1
+                    DispatchQueue.main.async {
+                        self.jobs[index].status = "生成 MediaInfo \(nextMediaInfoNumber)/\(requestedMediaInfoCount)..."
+                    }
+                    do {
+                        let url = try self.generateMediaInfo(
+                            for: outputURL,
+                            in: self.mediaInfoDirectory ?? targetFolderURL
+                        )
+                        generatedMediaInfoCount += 1
+                        DispatchQueue.main.async {
+                            self.jobs[index].mediaInfoURL = url
+                        }
+                    } catch {
+                        failures.append("MediaInfo")
+                    }
+                }
+
+                let remainingScreenshotCount = requestedScreenshotCount - generatedScreenshotCount
+                let remainingJobCount = max(1, totalJobCount - index)
+                let screenshotCountForCurrentJob = remainingScreenshotCount > 0
+                    ? (remainingScreenshotCount + remainingJobCount - 1) / remainingJobCount
+                    : 0
+
+                if screenshotCountForCurrentJob > 0 {
+                    let completedBeforeCurrentJob = generatedScreenshotCount
+                    DispatchQueue.main.async {
+                        self.jobs[index].status = "生成字幕截图 \(completedBeforeCurrentJob)/\(requestedScreenshotCount)..."
+                    }
+                    do {
+                        let urls = try self.generateSubtitleScreenshots(
+                            for: job,
+                            outputURL: outputURL,
+                            destinationDirectory: self.screenshotDirectory ?? targetFolderURL,
+                            screenshotCount: screenshotCountForCurrentJob,
+                            progress: { completedForCurrentJob in
+                                DispatchQueue.main.async {
+                                    self.jobs[index].status = "生成字幕截图 \(completedBeforeCurrentJob + completedForCurrentJob)/\(requestedScreenshotCount)..."
+                                }
+                            }
+                        )
+                        generatedScreenshotCount += urls.count
+                        DispatchQueue.main.async {
+                            self.jobs[index].screenshotURLs = urls
+                        }
+                    } catch {
+                        failures.append("截图")
+                    }
+                }
+
+                let finalStatus = failures.isEmpty
+                    ? "✅ \(outputFileName)"
+                    : "⚠️ 已封装，\(failures.joined(separator: "/"))失败"
+                DispatchQueue.main.async {
+                    self.jobs[index].status = finalStatus
                 }
             }
             DispatchQueue.main.async { self.isProcessing = false }
@@ -333,11 +502,6 @@ class MuxerViewModel: ObservableObject {
     }
     
     private func runMkvMerge(job: MuxJob, output: URL) -> Bool {
-        let process = Process()
-        let pipe = Pipe()
-        
-        process.executableURL = URL(fileURLWithPath: mkvmergePath)
-        
         var args = ["-o", output.path]
         for track in job.internalTracks {
             args.append("--language")
@@ -359,15 +523,10 @@ class MuxerViewModel: ObservableObject {
         }
         args.append(job.subtitleURL.path)
         
-        process.arguments = args
-        process.standardOutput = pipe
-        process.standardError = pipe
-        
         do {
-            try process.run()
-            process.waitUntilExit()
+            let result = try runCommand(executablePath: mkvmergePath, arguments: args)
             // mkvmerge: 0 = 成功，1 = 成功但有警告，2 = 失败。
-            return process.terminationStatus < 2
+            return result.status < 2
         } catch {
             return false
         }
@@ -398,53 +557,266 @@ class MuxerViewModel: ObservableObject {
         return characterSetName as String
     }
 
-    func generateMediaInfoForSelectedJob() {
-        guard let outputURL = selectedOutputURL else { return }
+    private func generateMediaInfo(for outputURL: URL, in destinationDirectory: URL) throws -> URL {
         guard let mediaInfoPath else {
-            mediaInfoFileName = outputURL.lastPathComponent
-            mediaInfoText = "未找到 mediainfo 命令行工具。请重新使用打包脚本生成 App，或安装 MediaInfo。"
-            isShowingMediaInfo = true
-            return
+            throw PostProcessingError.toolUnavailable("MediaInfo")
         }
 
-        isGeneratingMediaInfo = true
+        try FileManager.default.createDirectory(
+            at: destinationDirectory,
+            withIntermediateDirectories: true
+        )
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
-            let standardOutput = Pipe()
-            let standardError = Pipe()
+        let result = try runCommand(executablePath: mediaInfoPath, arguments: [outputURL.path])
+        guard result.status == 0 else {
+            throw PostProcessingError.commandFailed(
+                "MediaInfo 生成失败：\(result.text.trimmingCharacters(in: .whitespacesAndNewlines))"
+            )
+        }
+        guard !result.data.isEmpty else {
+            throw PostProcessingError.invalidOutput("MediaInfo 未返回任何内容")
+        }
 
-            process.executableURL = URL(fileURLWithPath: mediaInfoPath)
-            process.arguments = [outputURL.path]
-            process.standardOutput = standardOutput
-            process.standardError = standardError
+        let stem = outputURL.deletingPathExtension().lastPathComponent
+        let destinationURL = destinationDirectory.appendingPathComponent("\(stem).MediaInfo.txt")
+        try result.data.write(to: destinationURL, options: .atomic)
+        return destinationURL
+    }
 
-            let resultText: String
-            do {
-                try process.run()
-                let outputData = standardOutput.fileHandleForReading.readDataToEndOfFile()
-                let errorData = standardError.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
+    private func generateSubtitleScreenshots(
+        for job: MuxJob,
+        outputURL: URL,
+        destinationDirectory: URL,
+        screenshotCount: Int,
+        progress: (Int) -> Void
+    ) throws -> [URL] {
+        guard let ffmpegPath else {
+            throw PostProcessingError.toolUnavailable("ffmpeg")
+        }
 
-                if process.terminationStatus == 0 {
-                    resultText = String(data: outputData, encoding: .utf8) ?? "MediaInfo 输出无法解码。"
-                } else {
-                    let errorText = String(data: errorData, encoding: .utf8) ?? "未知错误"
-                    resultText = "MediaInfo 生成失败：\n\(errorText)"
+        let subtitleTracks = job.internalTracks.filter { $0.type == "subtitles" } + [job.externalSubtitleTrack]
+        guard let selectedIndex = subtitleTracks.lastIndex(where: { isChineseLanguage($0.language) })
+                ?? subtitleTracks.indices.last else {
+            throw PostProcessingError.invalidOutput("封装文件中没有可用于截图的字幕轨")
+        }
+
+        try FileManager.default.createDirectory(
+            at: destinationDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mkv-package-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let cueTimes = subtitleCueTimes(
+            outputURL: outputURL,
+            subtitleIndex: selectedIndex,
+            count: screenshotCount
+        )
+        let extractedSubtitleURL = temporaryDirectory.appendingPathComponent("selected.ass")
+        let hasTextSubtitle = extractTextSubtitle(
+            outputURL: outputURL,
+            subtitleIndex: selectedIndex,
+            destinationURL: extractedSubtitleURL,
+            ffmpegPath: ffmpegPath
+        )
+
+        let stem = outputURL.deletingPathExtension().lastPathComponent
+        var screenshotURLs: [URL] = []
+
+        for (offset, cueTime) in cueTimes.enumerated() {
+            let destinationURL = destinationDirectory.appendingPathComponent(
+                String(format: "%@.%02d.png", stem, offset + 1)
+            )
+            let result: (status: Int32, data: Data, text: String)
+
+            if hasTextSubtitle {
+                let escapedOutputPath = escapeFFmpegFilterValue(outputURL.path)
+                var subtitleFilter = "subtitles=filename='\(escapedOutputPath)':si=\(selectedIndex)"
+                if isChineseLanguage(subtitleTracks[selectedIndex].language) {
+                    subtitleFilter += ":force_style='FontName=Hiragino Sans GB'"
                 }
-            } catch {
-                resultText = "MediaInfo 生成失败：\n\(error.localizedDescription)"
+                result = try runCommand(
+                    executablePath: ffmpegPath,
+                    arguments: [
+                        "-y", "-v", "error",
+                        "-ss", String(format: "%.3f", cueTime),
+                        "-copyts", "-i", outputURL.path,
+                        "-map", "0:v:0",
+                        "-vf", subtitleFilter,
+                        "-frames:v", "1", "-an", "-sn",
+                        destinationURL.path
+                    ]
+                )
+            } else {
+                result = try runCommand(
+                    executablePath: ffmpegPath,
+                    arguments: [
+                        "-y", "-v", "error",
+                        "-ss", String(format: "%.3f", cueTime),
+                        "-copyts", "-i", outputURL.path,
+                        "-filter_complex", "[0:v:0][0:s:\(selectedIndex)]overlay=eof_action=pass",
+                        "-frames:v", "1", "-an",
+                        destinationURL.path
+                    ]
+                )
             }
 
-            DispatchQueue.main.async {
-                self.mediaInfoFileName = outputURL.lastPathComponent
-                self.mediaInfoText = resultText
-                self.isGeneratingMediaInfo = false
-                self.isShowingMediaInfo = true
+            guard result.status == 0,
+                  FileManager.default.fileExists(atPath: destinationURL.path),
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: destinationURL.path),
+                  (attributes[.size] as? NSNumber)?.intValue ?? 0 > 0 else {
+                try? FileManager.default.removeItem(at: destinationURL)
+                for screenshotURL in screenshotURLs {
+                    try? FileManager.default.removeItem(at: screenshotURL)
+                }
+                let detail = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                throw PostProcessingError.commandFailed(
+                    detail.isEmpty ? "第 \(offset + 1) 张字幕截图生成失败" : detail
+                )
             }
+
+            screenshotURLs.append(destinationURL)
+            progress(offset + 1)
+        }
+
+        return screenshotURLs
+    }
+
+    private func subtitleCueTimes(outputURL: URL, subtitleIndex: Int, count: Int) -> [Double] {
+        let count = max(0, count)
+        guard count > 0 else { return [] }
+        guard let ffprobePath,
+              let result = try? runCommand(
+                executablePath: ffprobePath,
+                arguments: [
+                    "-v", "error",
+                    "-select_streams", "s:\(subtitleIndex)",
+                    "-show_packets",
+                    "-show_entries", "packet=pts_time,duration_time",
+                    "-of", "json",
+                    outputURL.path
+                ]
+              ),
+              result.status == 0,
+              let json = try? JSONSerialization.jsonObject(with: result.data) as? [String: Any],
+              let packets = json["packets"] as? [[String: Any]] else {
+            return fallbackScreenshotTimes(for: outputURL, count: count)
+        }
+
+        let cues: [Double] = packets.compactMap { packet in
+            guard let startText = packet["pts_time"] as? String,
+                  let start = Double(startText),
+                  start >= 0 else { return nil }
+            let duration = (packet["duration_time"] as? String).flatMap(Double.init) ?? 0.2
+            return start + min(max(duration / 2, 0.05), 2.0)
+        }.sorted()
+
+        guard !cues.isEmpty else { return fallbackScreenshotTimes(for: outputURL, count: count) }
+
+        return (0..<count).map { offset in
+            let position = Double(offset + 1) / Double(count + 1)
+            let index = min(cues.count - 1, Int(Double(cues.count) * position))
+            return cues[index]
         }
     }
-    
+
+    private func fallbackScreenshotTimes(for outputURL: URL, count: Int = 3) -> [Double] {
+        let duration = mediaDuration(for: outputURL) ?? 240
+        guard count > 0 else { return [] }
+        return (0..<count).map { offset in
+            let position = Double(offset + 1) / Double(count + 1)
+            return max(duration * position, 0)
+        }
+    }
+
+    private func mediaDuration(for outputURL: URL) -> Double? {
+        guard let mediaInfoPath,
+              let result = try? runCommand(
+                executablePath: mediaInfoPath,
+                arguments: ["--Inform=General;%Duration%", outputURL.path]
+              ),
+              result.status == 0,
+              let milliseconds = Double(result.text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              milliseconds > 0 else { return nil }
+        return milliseconds / 1000
+    }
+
+    private func extractTextSubtitle(
+        outputURL: URL,
+        subtitleIndex: Int,
+        destinationURL: URL,
+        ffmpegPath: String
+    ) -> Bool {
+        guard let result = try? runCommand(
+            executablePath: ffmpegPath,
+            arguments: [
+                "-y", "-v", "error",
+                "-i", outputURL.path,
+                "-map", "0:s:\(subtitleIndex)",
+                "-c:s", "ass",
+                destinationURL.path
+            ]
+        ), result.status == 0,
+           let attributes = try? FileManager.default.attributesOfItem(atPath: destinationURL.path),
+           (attributes[.size] as? NSNumber)?.intValue ?? 0 > 0 else {
+            return false
+        }
+        return true
+    }
+
+    private func isChineseLanguage(_ language: String) -> Bool {
+        let normalized = language.lowercased().split(separator: "-").first.map(String.init) ?? language.lowercased()
+        return ["chi", "zho", "zh", "cmn", "yue"].contains(normalized)
+    }
+
+    private func escapeFFmpegFilterValue(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: ":", with: "\\:")
+            .replacingOccurrences(of: ",", with: "\\,")
+            .replacingOccurrences(of: "[", with: "\\[")
+            .replacingOccurrences(of: "]", with: "\\]")
+            .replacingOccurrences(of: ";", with: "\\;")
+    }
+
+    private func runCommand(
+        executablePath: String,
+        arguments: [String]
+    ) throws -> (status: Int32, data: Data, text: String) {
+        let process = Process()
+        let outputPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        if ["ffmpeg", "ffprobe"].contains(URL(fileURLWithPath: executablePath).lastPathComponent),
+           let resourceURL = Bundle.main.resourceURL {
+            let fontConfigDirectory = resourceURL
+                .appendingPathComponent("ffmpeg_portable/fontconfig", isDirectory: true)
+            let fontConfigFile = fontConfigDirectory.appendingPathComponent("fonts.conf")
+            if FileManager.default.fileExists(atPath: fontConfigFile.path) {
+                var environment = ProcessInfo.processInfo.environment
+                environment["FONTCONFIG_PATH"] = fontConfigDirectory.path
+                environment["FONTCONFIG_FILE"] = fontConfigFile.path
+                process.environment = environment
+            }
+        }
+
+        try process.run()
+        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            data,
+            String(data: data, encoding: .utf8) ?? ""
+        )
+    }
+
     private func outputFileName(for job: MuxJob) -> String {
         let episodeNum = extractEpisodeNumber(from: job.baseName)
         if episodeNum.isEmpty {
@@ -634,78 +1006,31 @@ struct TrackRowView: View {
     }
 }
 
-// MARK: - MediaInfo 查看、复制与导出窗口
-struct MediaInfoSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @Binding var text: String
-    let fileName: String
-    @State private var exportMessage = ""
-
-    private var suggestedExportName: String {
-        let stem = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
-        return "\(stem).MediaInfo.txt"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("MediaInfo")
-                .font(.title2.bold())
-            Text(fileName)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            TextEditor(text: $text)
-                .font(.system(.body, design: .monospaced))
-                .frame(minWidth: 760, minHeight: 500)
-                .border(Color.secondary.opacity(0.3))
-
-            HStack {
-                Button("复制全部") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(text, forType: .string)
-                    exportMessage = "已复制到剪贴板"
-                }
-
-                Button("导出 TXT…") {
-                    exportText()
-                }
-
-                if !exportMessage.isEmpty {
-                    Text(exportMessage)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Spacer()
-                Button("关闭") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-            }
-        }
-        .padding(20)
-    }
-
-    private func exportText() {
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = suggestedExportName
-        panel.canCreateDirectories = true
-        panel.message = "导出 MediaInfo 文本信息"
-
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
-
-        do {
-            try text.write(to: destination, atomically: true, encoding: .utf8)
-            exportMessage = "已导出：\(destination.lastPathComponent)"
-        } catch {
-            exportMessage = "导出失败：\(error.localizedDescription)"
-        }
-    }
-}
-
 // MARK: - 主界面 UI
 struct ContentView: View {
     @StateObject private var viewModel = MuxerViewModel()
+
+    private var backgroundImage: NSImage? {
+        guard let url = viewModel.backgroundImageURL else { return nil }
+        return NSImage(contentsOf: url)
+    }
+
+    private func trackBinding(for track: MediaTrack, in jobID: UUID) -> Binding<MediaTrack> {
+        Binding(
+            get: {
+                guard let job = viewModel.jobs.first(where: { $0.id == jobID }) else {
+                    return track
+                }
+                if track.isExternal {
+                    return job.externalSubtitleTrack
+                }
+                return job.internalTracks.first(where: { $0.trackID == track.trackID }) ?? track
+            },
+            set: { updatedTrack in
+                viewModel.setLanguage(updatedTrack.language, for: track, in: jobID)
+            }
+        )
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -723,6 +1048,47 @@ struct ContentView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     
+                    Spacer()
+                }
+
+                HStack(spacing: 12) {
+                    Button("MediaInfo 目录") { viewModel.selectMediaInfoDirectory() }
+                        .frame(width: 120)
+
+                    Text(viewModel.mediaInfoDirectory?.path ?? "MediaInfo：选择输入文件夹后使用该目录")
+                        .foregroundColor(viewModel.mediaInfoDirectory == nil ? .gray : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Button("截图目录") { viewModel.selectScreenshotDirectory() }
+                        .frame(width: 100)
+
+                    Text(viewModel.screenshotDirectory?.path ?? "截图：选择输入文件夹后使用该目录")
+                        .foregroundColor(viewModel.screenshotDirectory == nil ? .gray : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                HStack(spacing: 18) {
+                    Stepper("MediaInfo 获取个数：\(viewModel.mediaInfoCount)", value: $viewModel.mediaInfoCount, in: 1...999)
+                        .fixedSize()
+                    Stepper("截图张数：\(viewModel.screenshotCount)", value: $viewModel.screenshotCount, in: 1...99)
+                        .fixedSize()
+
+                    Divider().frame(height: 20)
+
+                    Button("设定背景图片") { viewModel.selectBackgroundImage() }
+                    if viewModel.backgroundImageURL != nil {
+                        Button("清除背景") { viewModel.backgroundImageURL = nil }
+                    }
+                    Text("透明度")
+                    Slider(value: $viewModel.backgroundOpacity, in: 0...1)
+                        .frame(width: 130)
+                    Text("\(Int(viewModel.backgroundOpacity * 100))%")
+                        .monospacedDigit()
+                        .frame(width: 36, alignment: .trailing)
                     Spacer()
                 }
                 
@@ -759,7 +1125,7 @@ struct ContentView: View {
                 }
             }
             .padding()
-            .background(Color(NSColor.windowBackgroundColor))
+            .background(Color.clear)
             
             Divider()
             
@@ -779,15 +1145,23 @@ struct ContentView: View {
                                 if job.status != "等待中" {
                                     Text(job.status)
                                         .font(.caption)
-                                        .foregroundColor(job.status.contains("✅") ? .green : .red)
+                                        .foregroundColor(
+                                            job.status.contains("✅") ? .green
+                                                : job.status.contains("⚠️") ? .orange
+                                                : job.status.contains("❌") ? .red
+                                                : .secondary
+                                        )
                                         .lineLimit(1)
                                 }
                             }
                             .tag(job.id)
+                            .listRowBackground(Color.clear)
                         }
                     }
+                    .scrollContentBackground(.hidden)
+                    .background(Color.clear)
                 }
-                .frame(minWidth: 280, maxWidth: 380)
+                .frame(minWidth: 280, maxWidth: .infinity)
                 
                 Divider()
                 
@@ -805,9 +1179,12 @@ struct ContentView: View {
                                         .foregroundColor(.gray)
                                         .padding(.vertical, 8)
                                 } else {
-                                    ForEach($viewModel.jobs[selectedJobIndex].internalTracks) { $track in
+                                    ForEach(viewModel.jobs[selectedJobIndex].internalTracks) { track in
                                         TrackRowView(
-                                            track: $track,
+                                            track: trackBinding(
+                                                for: track,
+                                                in: viewModel.jobs[selectedJobIndex].id
+                                            ),
                                             typeLabel: viewModel.translateType(track.type),
                                             codecLabel: track.codec
                                         )
@@ -819,23 +1196,18 @@ struct ContentView: View {
                             
                             Section(header: Text("外部轨道 (源字幕文件)").bold()) {
                                 TrackRowView(
-                                    track: $viewModel.jobs[selectedJobIndex].externalSubtitleTrack,
+                                    track: trackBinding(
+                                        for: viewModel.jobs[selectedJobIndex].externalSubtitleTrack,
+                                        in: viewModel.jobs[selectedJobIndex].id
+                                    ),
                                     typeLabel: "外挂字幕 💬",
                                     codecLabel: "srt/ass"
                                 )
                             }
-                            
-                            Button(action: {
-                                viewModel.applyCurrentSettingsToAll()
-                            }) {
-                                HStack {
-                                    Image(systemName: "doc.on.doc")
-                                    Text("将此语言组合应用到所有其他文件")
-                                }
-                            }
-                            .padding(.top, 20)
                         }
                         .padding(.horizontal)
+                        .scrollContentBackground(.hidden)
+                        .background(Color.clear)
                     } else {
                         VStack {
                             Spacer()
@@ -847,44 +1219,57 @@ struct ContentView: View {
                     }
                     Spacer()
                 }
-                .frame(minWidth: 500)
+                .frame(minWidth: 280, maxWidth: .infinity)
             }
             
             Divider()
             
             // MARK: - 底部操作按钮
-            HStack(spacing: 12) {
-                Button(action: {
-                    viewModel.startBatchMuxing()
-                }) {
-                    Text(viewModel.isProcessing ? "正在封装..." : "开始批量封装 (\(viewModel.jobs.count) 个文件)")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(viewModel.jobs.isEmpty || viewModel.isProcessing)
-
-                Button(action: {
-                    viewModel.generateMediaInfoForSelectedJob()
-                }) {
-                    HStack {
-                        Image(systemName: "doc.text.magnifyingglass")
-                        Text(viewModel.isGeneratingMediaInfo ? "正在生成…" : "生成 MediaInfo")
+            GeometryReader { geometry in
+                HStack {
+                    Spacer()
+                    Button(action: {
+                        viewModel.startBatchMuxing()
+                    }) {
+                        Text(viewModel.isProcessing ? "正在封装..." : "开始批量封装 (\(viewModel.jobs.count) 个文件)")
+                            .frame(maxWidth: .infinity)
                     }
-                    .frame(minWidth: 150)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .frame(width: geometry.size.width / 4)
+                    .disabled(viewModel.jobs.isEmpty || viewModel.isProcessing)
+                    Spacer()
                 }
-                .controlSize(.large)
-                .disabled(viewModel.selectedOutputURL == nil || viewModel.isProcessing || viewModel.isGeneratingMediaInfo)
             }
+            .frame(height: 38)
             .padding()
-            .background(Color(NSColor.windowBackgroundColor))
+            .background(Color.clear)
         }
         .frame(minWidth: 900, minHeight: 600)
-        .sheet(isPresented: $viewModel.isShowingMediaInfo) {
-            MediaInfoSheet(
-                text: $viewModel.mediaInfoText,
-                fileName: viewModel.mediaInfoFileName
-            )
+        .background {
+            GeometryReader { geometry in
+                ZStack {
+                    Color(NSColor.windowBackgroundColor)
+
+                    if let backgroundImage {
+                        Image(nsImage: backgroundImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(
+                                width: geometry.size.width,
+                                height: geometry.size.height
+                            )
+                            .clipped()
+                            .opacity(viewModel.backgroundOpacity)
+                    }
+                }
+                .frame(
+                    width: geometry.size.width,
+                    height: geometry.size.height
+                )
+                .clipped()
+                .allowsHitTesting(false)
+            }
         }
     }
 }
