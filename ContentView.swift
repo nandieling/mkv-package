@@ -106,6 +106,11 @@ struct MuxJob: Identifiable, Equatable {
 
 // MARK: - 逻辑处理 ViewModel
 class MuxerViewModel: ObservableObject {
+    private enum PreferenceKey {
+        static let backgroundImagePath = "backgroundImagePath"
+        static let backgroundOpacity = "backgroundOpacity"
+    }
+
     private enum PostProcessingError: LocalizedError {
         case toolUnavailable(String)
         case commandFailed(String)
@@ -121,6 +126,8 @@ class MuxerViewModel: ObservableObject {
         }
     }
 
+    private let preferences: UserDefaults
+
     @Published var jobs: [MuxJob] = []
     @Published var selectedJobID: UUID?
     @Published var isProcessing = false
@@ -131,11 +138,39 @@ class MuxerViewModel: ObservableObject {
     @Published var screenshotDirectory: URL? = nil
     @Published var mediaInfoCount: Int = 1
     @Published var screenshotCount: Int = 3
-    @Published var backgroundImageURL: URL? = nil
-    @Published var backgroundOpacity: Double = 0.15
+    @Published var backgroundImageURL: URL? = nil {
+        didSet {
+            if let path = backgroundImageURL?.path {
+                preferences.set(path, forKey: PreferenceKey.backgroundImagePath)
+            } else {
+                preferences.removeObject(forKey: PreferenceKey.backgroundImagePath)
+            }
+        }
+    }
+    @Published var backgroundOpacity: Double = 0.15 {
+        didSet {
+            preferences.set(backgroundOpacity, forKey: PreferenceKey.backgroundOpacity)
+        }
+    }
     @Published var customShowName: String = ""
     @Published var outputPrefix: String = "S01E"
     @Published var customSuffix: String = ""
+
+    init(preferences: UserDefaults = .standard) {
+        self.preferences = preferences
+
+        if let path = preferences.string(forKey: PreferenceKey.backgroundImagePath),
+           FileManager.default.fileExists(atPath: path) {
+            backgroundImageURL = URL(fileURLWithPath: path)
+        }
+
+        if preferences.object(forKey: PreferenceKey.backgroundOpacity) != nil {
+            let savedOpacity = preferences.double(forKey: PreferenceKey.backgroundOpacity)
+            if savedOpacity.isFinite {
+                backgroundOpacity = min(max(savedOpacity, 0), 1)
+            }
+        }
+    }
     
     // 智能获取打包后的 mkvmerge 路径
     var mkvmergePath: String {
